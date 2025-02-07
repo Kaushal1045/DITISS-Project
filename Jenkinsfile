@@ -8,92 +8,123 @@ pipeline {
 
     environment {
         SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_CREDENTIALS_ID = 'docker-hub'
+        DOCKER_IMAGE = 'kaushal1045/pet-clinic'
+        DOCKER_TAG = "build-${env.BUILD_NUMBER}"  // Unique build tag
+        DEPLOYMENT_FILE = "deployment/deployment.yml"
+        GIT_USER_NAME = "kaushal1045"
+        GIT_REPO_NAME = "DITISS-Project"
     }
 
     stages {
-        stage('Git Checkout') {
+        stage('Checkout Code') {
             steps {
-                git branch: 'main', changelog: false, poll: false, url: 'https://github.com/Kaushal1045/DITISS-Project.git'
+                cleanWs()  // Ensure clean workspace for each build
+                git branch: 'main', url: "https://github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git"
+                checkout scmGit(branches: [[name: '*/main']], extensions: [], userRemoteConfigs: [[credentialsId: 'github-account', url: 'https://github.com/Kaushal1045/DITISS-Project.git']])
             }
         }
 
-        stage('Code compile') {
+        stage('Compile Code') {
             steps {
-                sh "mvn clean compile"
+                sh 'mvn clean compile'
             }
         }
 
-        stage('Unit Test') {
+        stage('Run Unit Tests') {
             steps {
-                sh "mvn test"
+                sh 'mvn test'
             }
         }
 
-        stage('sonar-scanner') {
+        stage('Static Code Analysis') {
             steps {
-                withSonarQubeEnv(credentialsId: 'new-ver-sonar', installationName: 'Sonar-server') {
+                withSonarQubeEnv('Sonar-server') {
                     sh '''
-                        $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=Petclinic \
-                        -Dsonar.exclusions=**/*.java \
-                        -Dsonar.projectKey=Petclinic
+                        ${SCANNER_HOME}/bin/sonar-scanner \
+                        -Dsonar.projectKey=Petclinic \
+                        -Dsonar.projectName=Petclinic \
+                        -Dsonar.sources=src \
+                        -Dsonar.java.binaries=target/classes
                     '''
                 }
             }
         }
 
-        stage('OWASP Scan') {
+        stage('Dependency Vulnerability Scan') {
             steps {
-                // Run the Dependency-Check scan and generate an XML report
                 dependencyCheck additionalArguments: '--scan ./ --format XML --out .', odcInstallation: 'DP-check'
-
-                // Publish the generated XML report
                 dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
             }
         }
 
         stage('Build Artifact') {
             steps {
-                sh "mvn clean install"
+                sh 'mvn clean package'
             }
         }
 
-        stage('Docker Build') {
+        stage('Build and Push Docker Image') {
             steps {
                 script {
-                    withDockerRegistry(credentialsId: 'docker-hub', toolName: 'docker') {
-                        // Build Docker image
-                        sh "docker build -t petclinic ."
+                    docker.withRegistry('', DOCKER_CREDENTIALS_ID) {
+                        def appImage = docker.build("${DOCKER_IMAGE}:${DOCKER_TAG}")
+                        appImage.push()
                     }
                 }
             }
         }
 
-        stage('Docker Tag & Push') {
-            steps {
-                script {
-                    withDockerRegistry(credentialsId: 'docker-hub', toolName: 'docker') {
-                        // Tag Docker image with a version (e.g., build number or commit ID)
-                        def imageTag = "kaushal1045/pet-clinic:latest"
-                        sh "docker tag petclinic1 $imageTag"
-
-                        // Push to Docker Hub
-                        sh "docker push $imageTag"
-                    }
-                }
-            }
+        stage('Update Deployment File') {
+    steps {
+        withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+            sh '''
+                git config --global user.email "kaushal.m.suryawanshi@gmail.com"
+                git config --global user.name "kaushal1045"
+                
+                # Stash any local changes before pulling
+                git stash save "temporary changes"
+                
+                # Pull the latest changes from the main branch
+                git pull --rebase origin main
+                
+                # Ensure the placeholder exists in the deployment.yml file
+                if ! grep -q 'replaceImageTag' deployment/deployment.yml; then
+                    echo "replaceImageTag placeholder not found. Adding it back."
+                    sed -i 's|image: .*|image: kaushal1045/pet-clinic:replaceImageTag|' deployment/deployment.yml
+                fi
+                
+                # Update image tag in deployment.yml with the build number
+                sed -i "s|replaceImageTag|${BUILD_NUMBER}|g" deployment/deployment.yml
+                
+                # Check if there are changes to commit
+                git diff --quiet || (git add deployment/deployment.yml && git commit -m "Update deployment image to version ${BUILD_NUMBER}")
+                
+                # Push the changes to the remote repository
+                git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
+                
+                # Apply stashed changes (if any)
+                git stash pop
+            '''
         }
+    }
+}
 
-        stage('Docker Deploy') {
-            steps {
-                script {
-                    // Deploy the container
-                    def containerName = "pet"
-                    sh "docker run -d --name $containerName -p 8082:8080 kaushal1045/pet-clinic:latest"
 
-                    // Optionally, verify if the container is running (you could also use docker ps to confirm)
-                    sh "docker ps -f name=$containerName"
-                }
-            }
+
+
+    }
+
+    post {
+        success {
+            mail to: 'kaushal.m.suryawanshi@gmail.com',
+                 subject: "SUCCESS: Build ${env.BUILD_NUMBER}",
+                 body: "The build was successful. Docker image: ${DOCKER_IMAGE}:${DOCKER_TAG}. Check the details at ${env.BUILD_URL}"
+        }
+        failure {
+            mail to: 'kaushal.m.suryawanshi@gmail.com',
+                 subject: "FAILURE: Build ${env.BUILD_NUMBER}",
+                 body: "The build failed. Check the details at ${env.BUILD_URL}"
         }
     }
 }
