@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     tools {
-        jdk 'jdk11'
+        jdk 'jdk17'
         maven 'maven3'
     }
 
@@ -10,30 +10,22 @@ pipeline {
         SCANNER_HOME = tool 'sonar-scanner'
         DOCKER_CREDENTIALS_ID = 'docker-hub'
         DOCKER_IMAGE = 'kaushal1045/pet-clinic'
-        DOCKER_TAG = "build-${env.BUILD_NUMBER}"  // Unique build tag
+        DOCKER_TAG = "build-${env.BUILD_NUMBER}"
+        GIT_REPO = "kaushal1045/DITISS-Project"
         DEPLOYMENT_FILE = "deployment/deployment.yml"
-        GIT_USER_NAME = "kaushal1045"
-        GIT_REPO_NAME = "DITISS-Project"
     }
 
     stages {
         stage('Checkout Code') {
             steps {
-                cleanWs()  // Ensure clean workspace for each build
-                git branch: 'main', url: "https://github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git"
-                checkout scmGit(branches: [[name: '*/main']], extensions: [], userRemoteConfigs: [[credentialsId: 'github-account', url: 'https://github.com/Kaushal1045/DITISS-Project.git']])
+                cleanWs()
+                git branch: 'main', credentialsId: 'github-account', url: "https://github.com/${GIT_REPO}.git"
             }
         }
 
-        stage('Compile Code') {
+        stage('Build and Test') {
             steps {
-                sh 'mvn clean compile'
-            }
-        }
-
-        stage('Run Unit Tests') {
-            steps {
-                sh 'mvn test'
+                sh 'mvn clean package'
             }
         }
 
@@ -53,78 +45,49 @@ pipeline {
 
         stage('Dependency Vulnerability Scan') {
             steps {
-                dependencyCheck additionalArguments: '--scan ./ --format XML --out .', odcInstallation: 'DP-check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                dependencyCheck additionalArguments: '--scan ./ --format HTML --out .', odcInstallation: 'DP-check'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.html'
             }
         }
 
-        stage('Build Artifact') {
+            stage('Build & Push Docker Image') {
             steps {
-                sh 'mvn clean package'
-            }
-        }
-
-        stage('Build and Push Docker Image') {
-            steps {
-                script {
-                    docker.withRegistry('', DOCKER_CREDENTIALS_ID) {
-                        def appImage = docker.build("${DOCKER_IMAGE}:${DOCKER_TAG}")
-                        appImage.push()
-                    }
+                withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    sh """
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} .
+                        docker push ${DOCKER_IMAGE}:${DOCKER_TAG}
+                        docker logout
+                    """
                 }
             }
         }
 
+
+
         stage('Update Deployment File') {
-    steps {
-        withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
-            sh '''
-                git config --global user.email "kaushal.m.suryawanshi@gmail.com"
-                git config --global user.name "kaushal1045"
-                
-                # Stash any local changes before pulling
-                git stash save "temporary changes"
-                
-                # Pull the latest changes from the main branch
-                git pull --rebase origin main
-                
-                # Ensure the placeholder exists in the deployment.yml file
-                if ! grep -q 'replaceImageTag' deployment/deployment.yml; then
-                    echo "replaceImageTag placeholder not found. Adding it back."
-                    sed -i 's|image: .*|image: kaushal1045/pet-clinic:replaceImageTag|' deployment/deployment.yml
-                fi
-                
-                # Update image tag in deployment.yml with the build number
-                sed -i "s|replaceImageTag|build-${BUILD_NUMBER}|g" deployment/deployment.yml
-                
-                # Check if there are changes to commit
-                git diff --quiet || (git add deployment/deployment.yml && git commit -m "Update deployment image to version ${BUILD_NUMBER}")
-                
-                # Push the changes to the remote repository
-                git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
-                
-                # Apply stashed changes (if any)
-                git stash pop
-            '''
+            steps {
+                withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+                    sh '''
+                        git config --global user.email "kaushal.m.suryawanshi@gmail.com"
+                        git config --global user.name "kaushal1045"
+                        
+                        sed -i "s|image: .*|image: ${DOCKER_IMAGE}:${DOCKER_TAG}|" ${DEPLOYMENT_FILE}
+
+                        git add ${DEPLOYMENT_FILE}
+                        git commit -m "Update deployment image to ${DOCKER_TAG}" || echo "No changes to commit"
+                        git push https://${GITHUB_TOKEN}@github.com/${GIT_REPO}.git HEAD:main
+                    '''
+                }
+            }
         }
-    }
-}
-
-
-
-
     }
 
     post {
-        success {
+        always {
             mail to: 'kaushal.m.suryawanshi@gmail.com',
-                 subject: "SUCCESS: Build ${env.BUILD_NUMBER}",
-                 body: "The build was successful. Docker image: ${DOCKER_IMAGE}:${DOCKER_TAG}. Check the details at ${env.BUILD_URL}"
-        }
-        failure {
-            mail to: 'kaushal.m.suryawanshi@gmail.com',
-                 subject: "FAILURE: Build ${env.BUILD_NUMBER}",
-                 body: "The build failed. Check the details at ${env.BUILD_URL}"
+                 subject: "Build ${env.BUILD_NUMBER} - ${currentBuild.result}",
+                 body: "Check the build details at ${env.BUILD_URL}"
         }
     }
 }
